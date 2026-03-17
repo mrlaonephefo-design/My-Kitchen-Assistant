@@ -1,11 +1,48 @@
 import { GoogleGenAI, Type } from "@google/genai";
 import { useState, FormEvent, useEffect } from "react";
-import { ChefHat, Plus, X, Loader2, Utensils, Clock, Flame, Heart, Bookmark, Search, Sparkles, Globe, Image as ImageIcon } from "lucide-react";
+import { ChefHat, Plus, X, Loader2, Utensils, Clock, Flame, Heart, Bookmark, Search, Sparkles, Globe, Image as ImageIcon, Star } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import Markdown from "react-markdown";
 
-// Initialize Gemini API
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+// Helper for exponential backoff
+const fetchWithRetry = async <T,>(
+  apiCall: () => Promise<T>,
+  maxRetries: number = 3,
+  baseDelay: number = 1000
+): Promise<T> => {
+  let attempt = 0;
+  while (attempt < maxRetries) {
+    try {
+      return await apiCall();
+    } catch (error: any) {
+      attempt++;
+      const errorString = error?.message || String(error);
+      const isRetryable = errorString.includes("503") || 
+                          errorString.includes("429") || 
+                          errorString.includes("high demand") || 
+                          errorString.includes("UNAVAILABLE");
+                          
+      if (!isRetryable || attempt >= maxRetries) {
+        throw error;
+      }
+      
+      // Exponential backoff with jitter
+      const delay = baseDelay * Math.pow(2, attempt - 1) + Math.random() * 1000;
+      console.log(`API call failed, retrying in ${Math.round(delay)}ms (attempt ${attempt}/${maxRetries})...`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+  throw new Error("Max retries reached");
+};
+
+declare global {
+  interface Window {
+    aistudio?: {
+      hasSelectedApiKey: () => Promise<boolean>;
+      openSelectKey: () => Promise<void>;
+    };
+  }
+}
 
 interface Recipe {
   title: string;
@@ -29,6 +66,8 @@ const COMMON_INGREDIENTS = [
 ];
 
 export default function App() {
+  const [hasApiKey, setHasApiKey] = useState<boolean | null>(null);
+  const [imageSize, setImageSize] = useState<"1K" | "2K" | "4K">("1K");
   const [ingredients, setIngredients] = useState<IngredientItem[]>([]);
   const [inputValue, setInputValue] = useState("");
   const [quantityValue, setQuantityValue] = useState("");
@@ -48,6 +87,7 @@ export default function App() {
   // Image state
   const [recipeImages, setRecipeImages] = useState<Record<string, string>>({});
   const [loadingImages, setLoadingImages] = useState<Record<string, boolean>>({});
+  const [imageErrors, setImageErrors] = useState<Record<string, string>>({});
 
   // Local Storage for saved recipes
   const [savedRecipes, setSavedRecipes] = useState<Recipe[]>(() => {
@@ -55,9 +95,31 @@ export default function App() {
     return saved ? JSON.parse(saved) : [];
   });
 
+  // Local Storage for ratings
+  const [ratings, setRatings] = useState<Record<string, number>>(() => {
+    const saved = localStorage.getItem('pantryChefRatings');
+    return saved ? JSON.parse(saved) : {};
+  });
+
+  useEffect(() => {
+    const checkKey = async () => {
+      if (window.aistudio?.hasSelectedApiKey) {
+        const hasKey = await window.aistudio.hasSelectedApiKey();
+        setHasApiKey(hasKey);
+      } else {
+        setHasApiKey(true); // Fallback if not in AI Studio
+      }
+    };
+    checkKey();
+  }, []);
+
   useEffect(() => {
     localStorage.setItem('pantryChefSavedRecipes', JSON.stringify(savedRecipes));
   }, [savedRecipes]);
+
+  useEffect(() => {
+    localStorage.setItem('pantryChefRatings', JSON.stringify(ratings));
+  }, [ratings]);
 
   const toggleIngredient = (ing: string) => {
     const lowerIng = ing.toLowerCase();
@@ -97,15 +159,16 @@ export default function App() {
   const fetchRecipeTips = async (recipe: Recipe) => {
     setLoadingTips(prev => ({ ...prev, [recipe.title]: true }));
     try {
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY as string });
       const prompt = `Find professional cooking tips, nutritional insights, or popular variations for a recipe titled '${recipe.title}' made with: ${recipe.ingredients.join(', ')}. Use Google Search to get the most accurate and up-to-date information. Keep it concise (1-2 paragraphs).`;
       
-      const response = await ai.models.generateContent({
+      const response = await fetchWithRetry(() => ai.models.generateContent({
         model: "gemini-3-flash-preview",
         contents: prompt,
         config: {
           tools: [{ googleSearch: {} }]
         }
-      });
+      }));
       
       setRecipeTips(prev => ({ ...prev, [recipe.title]: response.text || "No tips found." }));
     } catch (err) {
@@ -118,17 +181,24 @@ export default function App() {
 
   const generateRecipeImage = async (recipe: Recipe) => {
     setLoadingImages(prev => ({ ...prev, [recipe.title]: true }));
+    setImageErrors(prev => ({ ...prev, [recipe.title]: "" }));
     try {
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY as string });
       const prompt = `A professional, appetizing food photography shot of ${recipe.title} made with ${recipe.ingredients.join(', ')}. Rustic presentation, vibrant colors, high quality, well-lit, cinematic culinary lighting, shallow depth of field, 4k resolution, food magazine style.`;
       
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash-image',
+      const response = await fetchWithRetry(() => ai.models.generateContent({
+        model: 'gemini-3-pro-image-preview',
         contents: {
           parts: [
             { text: prompt }
           ]
+        },
+        config: {
+          imageConfig: {
+            imageSize: imageSize
+          }
         }
-      });
+      }), 4, 2000); // 4 retries, starting at 2s for image generation
       
       let imageUrl = '';
       for (const part of response.candidates?.[0]?.content?.parts || []) {
@@ -144,8 +214,14 @@ export default function App() {
       } else {
         throw new Error("No image data returned");
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error("Error generating image:", err);
+      let errorMessage = "Failed to generate image. Please try again.";
+      const errorString = err?.message || String(err);
+      if (errorString.includes("503") || errorString.includes("high demand") || errorString.includes("UNAVAILABLE")) {
+        errorMessage = "The image generation model is currently experiencing high demand. Please try again later.";
+      }
+      setImageErrors(prev => ({ ...prev, [recipe.title]: errorMessage }));
     } finally {
       setLoadingImages(prev => ({ ...prev, [recipe.title]: false }));
     }
@@ -158,13 +234,14 @@ export default function App() {
     setError(null);
     
     try {
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY as string });
       const ingredientsList = ingredients.map(i => i.quantity ? `${i.quantity} ${i.name}` : i.name).join(", ");
       const prompt = `I have the following ingredients: ${ingredientsList}. 
       Please provide 3 to 5 creative and delicious recipes I can make using mostly these ingredients. 
       It's okay to assume I have basic pantry staples like salt, pepper, oil, water, etc.
       For each recipe, provide a title, a short appetizing description, prep time, cook time, difficulty level (Easy, Medium, Hard), a list of ingredients with measurements, and step-by-step instructions.`;
 
-      const response = await ai.models.generateContent({
+      const response = await fetchWithRetry(() => ai.models.generateContent({
         model: "gemini-3-flash-preview",
         contents: prompt,
         config: {
@@ -194,7 +271,7 @@ export default function App() {
             }
           }
         }
-      });
+      }));
 
       const jsonStr = response.text?.trim();
       if (jsonStr) {
@@ -204,9 +281,14 @@ export default function App() {
       } else {
         throw new Error("Received empty response from the model.");
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error("Error generating recipes:", err);
-      setError("Failed to generate recipes. Please try again.");
+      const errorString = err?.message || String(err);
+      if (errorString.includes("503") || errorString.includes("high demand") || errorString.includes("UNAVAILABLE")) {
+        setError("The recipe generation model is currently experiencing high demand. Please try again later.");
+      } else {
+        setError("Failed to generate recipes. Please try again.");
+      }
     } finally {
       setLoading(false);
     }
@@ -218,6 +300,7 @@ export default function App() {
     const isLoadingTips = !!loadingTips[recipe.title];
     const hasImage = !!recipeImages[recipe.title];
     const isLoadingImage = !!loadingImages[recipe.title];
+    const imageError = imageErrors[recipe.title];
     
     return (
       <motion.article 
@@ -250,15 +333,29 @@ export default function App() {
               <span className="text-sm font-medium tracking-wide uppercase">Cooking up an image...</span>
             </div>
           ) : (
-            <div className="w-full h-full flex flex-col items-center justify-center text-ink/40 bg-warm-bg/50">
+            <div className="w-full h-full flex flex-col items-center justify-center text-ink/40 bg-warm-bg/50 px-4 text-center">
               <ImageIcon className="w-12 h-12 mb-4 opacity-20" />
-              <button 
-                onClick={() => generateRecipeImage(recipe)}
-                className="px-6 py-2.5 bg-white text-ink rounded-full font-medium shadow-sm hover:shadow transition-all border border-ink/5 flex items-center gap-2"
-              >
-                <Sparkles className="w-4 h-4 text-olive" />
-                Generate Visual
-              </button>
+              {imageError && (
+                <p className="text-red-500 text-sm mb-4 max-w-md">{imageError}</p>
+              )}
+              <div className="flex items-center gap-3">
+                <select
+                  value={imageSize}
+                  onChange={(e) => setImageSize(e.target.value as "1K" | "2K" | "4K")}
+                  className="px-4 py-2.5 bg-white text-ink rounded-full font-medium shadow-sm border border-ink/5 outline-none focus:ring-2 focus:ring-olive/50 appearance-none cursor-pointer"
+                >
+                  <option value="1K">1K Size</option>
+                  <option value="2K">2K Size</option>
+                  <option value="4K">4K Size</option>
+                </select>
+                <button 
+                  onClick={() => generateRecipeImage(recipe)}
+                  className="px-6 py-2.5 bg-white text-ink rounded-full font-medium shadow-sm hover:shadow transition-all border border-ink/5 flex items-center gap-2"
+                >
+                  <Sparkles className="w-4 h-4 text-olive" />
+                  Generate Visual
+                </button>
+              </div>
             </div>
           )}
         </div>
@@ -266,6 +363,20 @@ export default function App() {
         <div className="p-8 md:p-10">
           <div className="mb-8 pr-12">
             <h3 className="text-3xl md:text-4xl font-serif text-ink mb-4">{recipe.title}</h3>
+            <div className="flex items-center gap-1 mb-6">
+              {[1, 2, 3, 4, 5].map(star => (
+                <button 
+                  key={star}
+                  onClick={() => setRatings(prev => ({...prev, [recipe.title]: star}))}
+                  className="focus:outline-none p-1 -ml-1 transition-transform hover:scale-110"
+                >
+                  <Star className={`w-6 h-6 ${star <= (ratings[recipe.title] || 0) ? 'fill-yellow-400 text-yellow-400' : 'text-ink/20 hover:text-yellow-200'}`} />
+                </button>
+              ))}
+              <span className="text-sm text-ink/50 ml-2 font-medium">
+                {ratings[recipe.title] ? `${ratings[recipe.title]} / 5 Stars` : 'Rate this recipe'}
+              </span>
+            </div>
             <p className="text-ink/70 text-lg leading-relaxed italic font-serif">{recipe.description}</p>
           </div>
           
@@ -362,6 +473,44 @@ export default function App() {
       recipe.ingredients.some(ing => ing.toLowerCase().includes(query))
     );
   });
+
+  if (hasApiKey === null) {
+    return <div className="min-h-screen flex items-center justify-center bg-warm-bg"><Loader2 className="w-8 h-8 animate-spin text-olive" /></div>;
+  }
+
+  if (!hasApiKey) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-warm-bg p-4">
+        <div className="bg-white p-8 rounded-[32px] shadow-sm max-w-md w-full text-center border border-ink/5">
+          <div className="w-16 h-16 bg-olive/10 rounded-full flex items-center justify-center mx-auto mb-6">
+            <ImageIcon className="w-8 h-8 text-olive" />
+          </div>
+          <h2 className="text-3xl font-serif text-ink mb-4">API Key Required</h2>
+          <p className="text-ink/70 mb-8 leading-relaxed">
+            To use the high-quality image generation features with Gemini 3 Pro, you need to select a paid Google Cloud API key.
+            <br/><br/>
+            <a href="https://ai.google.dev/gemini-api/docs/billing" target="_blank" rel="noreferrer" className="text-olive hover:underline font-medium">Learn more about billing</a>
+          </p>
+          <button
+            onClick={async () => {
+              try {
+                if (window.aistudio?.openSelectKey) {
+                  await window.aistudio.openSelectKey();
+                  setHasApiKey(true);
+                }
+              } catch (err) {
+                console.error(err);
+                setHasApiKey(false);
+              }
+            }}
+            className="px-8 py-4 bg-olive text-white rounded-full font-medium w-full hover:bg-olive-hover transition-all shadow-md hover:shadow-lg"
+          >
+            Select API Key
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen py-12 px-4 sm:px-6 lg:px-8">
