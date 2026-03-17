@@ -1,5 +1,5 @@
 {
-  "name": "Recipe Generator",
+  "name": "My Kitchen Assistant",
   "description": "Generate step-by-step recipes based on the ingredients you have.",
   "requestFramePermissions": []
 }
